@@ -141,7 +141,8 @@ const state = {
 };
 
 let serverProcess = null, playitProcess = null, playitRestartTimer = null, statsInterval = null;
-let claimSetupProcess = null;   // tracks `playit setup` while it's running, so we don't
+let claimSetupProcess = null;
+let playitSetupInProgress = false;   // prevents two concurrent installs (fixes the dpkg lock contention bug)   // tracks `playit setup` while it's running, so we don't
                                  // spawn duplicates and can clean it up when appropriate
 const clients = new Set();
 
@@ -274,7 +275,26 @@ async function setupPhAlias() {
 // AFTER: ensures Debian is installed (checked via `proot-distro list`'s real confirmed
 //        output format) and playitd exists inside it (checked via `which`, a standard
 //        Unix command, not a playit-specific guess).
-async function ensurePlayitReady() {
+// BEFORE: no protection against concurrent calls. If startPlayit() (auto-triggered when
+//         Paper becomes ready) and a manual "Setup Tunnel" tap happened close together, both
+//         could call this at once — real observed symptom: two overlapping pkg/apt installs
+//         fighting over Termux's own dpkg lock ("Waiting for cache lock... held by process
+//         ... (apt)").
+// AFTER: memoizes the in-flight promise — any concurrent caller (startPlayit(), the
+//        playit.setup handler, schedulePlayitRestart()) just awaits the SAME real operation
+//        instead of starting a duplicate one. No call site needs to change; this wrapper
+//        keeps the original name so every existing caller is protected automatically.
+let ensurePlayitReadyPromise = null;
+function ensurePlayitReady() {
+  if (!ensurePlayitReadyPromise) {
+    ensurePlayitReadyPromise = ensurePlayitReadyInner().finally(() => {
+      ensurePlayitReadyPromise = null;
+    });
+  }
+  return ensurePlayitReadyPromise;
+}
+
+async function ensurePlayitReadyInner() {
   await fs.mkdir(PLAYIT_DIR, { recursive: true });
 
   // Confirmed real output format:
@@ -1276,13 +1296,41 @@ async function handleRequest(action, payload = {}) {
     // AFTER: ensures Debian + playitd are installed, then starts the daemon. Connection
     //        state arrives via tunnel.status broadcasts; this returns immediately.
     case "playit.setup": {
-      await ensurePlayitReady();
-      if (playitProcess) {
-        await stopPlayit();
-        await new Promise(r => setTimeout(r, 800));
+      // BEFORE: awaited the full ensurePlayitReady() + startPlayit() chain before responding.
+      //         First-time setup installs an entire Debian environment (confirmed 5-8 minutes
+      //         on real device testing), but the app's WebSocket requests share a flat
+      //         25-second timeout — first-time setup could never finish in that window, so the
+      //         app always showed "Error: timeout: playit.setup" even though the real install
+      //         kept working correctly in the background (confirmed: tapping again afterward
+      //         found Debian already installed and surfaced a real claim link).
+      // AFTER: kicks off the real work without awaiting it here, returns immediately. The
+      //        existing tunnel.status broadcasts (already used for the claim-link flow) keep
+      //        the UI updated as things actually progress. A guard prevents this from ever
+      //        running twice concurrently, which also fixes a separate real bug: two
+      //        overlapping installs were fighting over Termux's own dpkg lock.
+      if (playitSetupInProgress) {
+        return { ok: true, alreadyRunning: true };
       }
-      await startPlayit();
-      return { ok: true };
+      playitSetupInProgress = true;
+      state.tunnel.state = "connecting";
+      broadcast("tunnel.status", { tunnel: state.tunnel });
+      (async () => {
+        try {
+          await ensurePlayitReady();
+          if (playitProcess) {
+            await stopPlayit();
+            await new Promise(r => setTimeout(r, 800));
+          }
+          await startPlayit();
+        } catch (err) {
+          log(`[playit] Setup failed: ${err.message}`);
+          state.tunnel.state = "error";
+          broadcast("tunnel.status", { tunnel: state.tunnel });
+        } finally {
+          playitSetupInProgress = false;
+        }
+      })();
+      return { ok: true, started: true };
     }
 
     // BEFORE: called execFileSync(PLAYIT_CLI, ["claim", "exchange", code]) — compiled binary, broken.
