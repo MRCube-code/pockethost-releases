@@ -28,6 +28,7 @@ const VIABACKWARDS_JAR_PATH = path.join(PLUGINS_DIR, "ViaBackwards-5.9.1.jar");
 //        referenced below was run/observed on a real device before being written here.
 const PLAYIT_DIR          = path.join(POCKETHOST_DIR, "playit");
 const PLAYIT_TUNNELS_FILE = path.join(PLAYIT_DIR, "tunnels.json");    // saved addresses (our own cache)
+const PLAYIT_SECRET_FILE  = path.join(PLAYIT_DIR, "secret.key");      // playit.gg agent secret, pasted by the user once
 const DEBIAN_DISTRO       = "debian";
 // Confirmed real: `proot-distro login debian -- playitd` starts the daemon non-interactively.
 // Confirmed real success line: "playit connected; tunnels loaded agent_id=... tunnel_count=2
@@ -141,9 +142,7 @@ const state = {
 };
 
 let serverProcess = null, playitProcess = null, playitRestartTimer = null, statsInterval = null;
-let claimSetupProcess = null;
-let playitSetupInProgress = false;   // prevents two concurrent installs (fixes the dpkg lock contention bug)   // tracks `playit setup` while it's running, so we don't
-                                 // spawn duplicates and can clean it up when appropriate
+let playitSetupInProgress = false;   // prevents two concurrent installs (fixes the dpkg lock contention bug)
 const clients = new Set();
 
 // ─── Logging & broadcast ──────────────────────────────────────────────────────
@@ -369,14 +368,29 @@ function parsePlayitLine(line) {
     log(`[playit] Connected — ${connectedMatch[1]} tunnel(s), account ${connectedMatch[2]}`);
   }
 
-  // ── CONFIRMED REAL: not yet claimed ────────────────────────────────────────
+  // ── CONFIRMED REAL: no valid secret configured. BEFORE: auto-triggered
+  //    startClaimSetup() (`playit setup`) here — CONFIRMED broken, that subcommand no
+  //    longer exists in the installed playit 1.0.10 CLI ("error: unexpected argument
+  //    'setup' found"). AFTER: this build of playit cannot generate its own claim link
+  //    at all (confirmed: left running 60+s with no secret, never printed one) — the
+  //    user supplies a secret key generated on playit.gg's own website instead, via the
+  //    playit.set_secret action. ──────────────────────────────────────────────────────
   if (/waiting for frontend secret provisioning/i.test(clean)) {
     state.tunnel.state  = "waiting_auth";
     state.tunnel.online = false;
     changed = true;
-    // Auto-trigger the claim command the instant we know we're unclaimed —
-    // this is what makes the link "appear fast" instead of needing a second tap.
-    startClaimSetup();
+  }
+
+  // ── CONFIRMED REAL: a previously-saved secret was rejected by playit.gg (real line
+  //    from your device: "configured agent secret is no longer valid
+  //    error=ApiError(Auth(InvalidAgentKey))"). Clear the dead secret so startPlayit()
+  //    doesn't keep retrying with it, and report the same "needs a key" state. ────────
+  if (/configured agent secret is no longer valid|InvalidAgentKey/i.test(clean)) {
+    log("[playit] Saved secret was rejected by playit.gg — clearing it.");
+    fs.rm(PLAYIT_SECRET_FILE, { force: true }).catch(() => {});
+    state.tunnel.state  = "waiting_auth";
+    state.tunnel.online = false;
+    changed = true;
   }
 
   // ── Reconnection churn — CONFIRMED to happen even during a successful run,
@@ -420,6 +434,22 @@ function parsePlayitLine(line) {
   if (changed) broadcast("tunnel.status", { tunnel: state.tunnel });
 }
 
+// Our own small cache of the user-pasted playit.gg secret key — see startPlayit()'s
+// BEFORE/AFTER comment below for why this replaces the old (now-broken) claim-link flow.
+async function getSavedSecret() {
+  try {
+    const s = (await fs.readFile(PLAYIT_SECRET_FILE, "utf8")).trim();
+    return s || null;
+  } catch {
+    return null;
+  }
+}
+
+async function saveSecret(secret) {
+  await fs.mkdir(PLAYIT_DIR, { recursive: true });
+  await fs.writeFile(PLAYIT_SECRET_FILE, secret.trim());
+}
+
 async function startPlayit() {
   if (playitProcess) return;
 
@@ -428,6 +458,28 @@ async function startPlayit() {
   } catch (err) {
     log(`[playit] Setup failed: ${err.message}`);
     state.tunnel.state  = "error";
+    state.tunnel.online = false;
+    broadcast("tunnel.status", { tunnel: state.tunnel });
+    return;
+  }
+
+  // BEFORE: spawned playitd with no secret and relied on startClaimSetup() (`playit
+  //         setup`) to generate a claim link — CONFIRMED broken: the installed playit
+  //         version (1.0.10) has no `setup`/`claim` subcommand at all anymore
+  //         ("error: unexpected argument 'setup' found"), and running the bare daemon
+  //         with no secret just hangs forever on "Waiting for frontend secret
+  //         provisioning over IPC" (confirmed: left running 60+s on a real device, no
+  //         claim link ever appeared).
+  // AFTER: the user pastes a secret key generated from playit.gg's own website
+  //        (confirmed real flow: playit.gg/account/setup/wizard -> "Docker" step shows
+  //        a SECRET_KEY=... value, even though Docker itself isn't used here) via the
+  //        playit.set_secret action. If we don't have one saved yet, don't spawn the
+  //        daemon at all — it would just hang — report waiting_auth so the app shows
+  //        the "enter your key" step instead.
+  const secret = await getSavedSecret();
+  if (!secret) {
+    log("[playit] No secret key saved yet — waiting for one from the app.");
+    state.tunnel.state  = "waiting_auth";
     state.tunnel.online = false;
     broadcast("tunnel.status", { tunnel: state.tunnel });
     return;
@@ -446,13 +498,14 @@ async function startPlayit() {
   log("[playit] Starting playitd inside Debian...");
 
   // CONFIRMED REAL on your device: `proot-distro login debian -- playitd` starts the
-  // daemon non-interactively and streams stdout/stderr normally.
+  // daemon non-interactively and streams stdout/stderr normally. `--secret` is a
+  // confirmed real flag from `playitd --help` ("Inline secret key for the daemon").
   // detached: true puts this in its own process group so stopPlayit() can signal the
   // whole proot-distro/proot/playitd tree at once — a plain single-PID kill isn't
   // guaranteed to reach playitd inside the proot jail, and that specific propagation
   // path wasn't part of what you tested (only interactive Ctrl+C was confirmed, which
   // the terminal itself broadcasts to the whole foreground process group automatically).
-  playitProcess = spawn("proot-distro", ["login", DEBIAN_DISTRO, "--", "playitd"], {
+  playitProcess = spawn("proot-distro", ["login", DEBIAN_DISTRO, "--", "playitd", "--secret", secret], {
     stdio:    ["ignore", "pipe", "pipe"],
     detached: true,
   });
@@ -470,7 +523,7 @@ async function startPlayit() {
   // 25s is well above the ~4s connect time seen in your real test.
   const stuckTimer = setTimeout(() => {
     if (state.tunnel.state === "connecting") {
-      log("[playit] No connection after 25s. If this is the first time, run the one-time claim from the Terminal tab: proot-distro login debian -- playit setup");
+      log("[playit] No connection after 25s. Check your internet connection, and that the secret key entered in the Tunnel tab is correct (get a new one at playit.gg/account/setup/wizard).");
       state.tunnel.state = "error";
       broadcast("tunnel.status", { tunnel: state.tunnel });
     }
@@ -518,10 +571,6 @@ async function schedulePlayitRestart() {
 //        (see detached: true above) with a plain-kill fallback if that fails.
 async function stopPlayit() {
   if (playitRestartTimer) { clearTimeout(playitRestartTimer); playitRestartTimer = null; }
-  if (claimSetupProcess) {
-    try { claimSetupProcess.kill("SIGKILL"); } catch {}
-    claimSetupProcess = null;
-  }
   if (playitProcess) {
     const pid = playitProcess.pid;
     try {
@@ -535,65 +584,6 @@ async function stopPlayit() {
   state.tunnel.state    = "disconnected";
   state.tunnel.claimUrl = "";
   broadcast("tunnel.status", { tunnel: state.tunnel });
-}
-
-// BEFORE (playit.claim handler used to do this inline): buffered ALL output and only
-//         returned it after the process closed OR after a 20-second timeout that force-
-//         killed it. Real evidence from your device: `playit setup` DOES print a genuine
-//         claim URL (confirmed format: https://playit.gg/claim/<code>), but it keeps running
-//         afterward waiting for you to complete the browser step — the 20s kill kept cutting
-//         it off before you could finish, and each restart minted a brand new URL.
-// AFTER: parses output line-by-line as it streams in. The moment the confirmed real URL
-//        pattern appears, it's written to state.tunnel.claimUrl and broadcast immediately —
-//        no waiting for the process to finish. The process itself is left running (not
-//        killed) so it can complete the IPC handoff to the already-running daemon once you
-//        finish in the browser; the daemon's own confirmed "connected" signal is what
-//        ultimately marks success. Only a generous real safety-net timeout (10 minutes, far
-//        beyond any realistic human claim time) cleans it up if it's genuinely abandoned.
-async function startClaimSetup() {
-  if (claimSetupProcess) return;   // already running, don't spawn a duplicate
-
-  log("[playit] Running one-time claim setup...");
-  claimSetupProcess = spawn("proot-distro", ["login", DEBIAN_DISTRO, "--", "playit", "setup"], {
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-
-  const handleLine = (l) => {
-    const clean = l.replace(/\x1b\[[0-9;]*m/g, "").trim();
-    if (!clean) return;
-    log(`[playit setup] ${clean}`);
-    const urlMatch = clean.match(/https:\/\/playit\.gg\/claim\/[a-zA-Z0-9]+/);
-    if (urlMatch && state.tunnel.claimUrl !== urlMatch[0]) {
-      state.tunnel.claimUrl = urlMatch[0];
-      state.tunnel.state    = "waiting_auth";
-      broadcast("tunnel.status", { tunnel: state.tunnel });
-      log(`[playit] Claim link ready: ${urlMatch[0]}`);
-    }
-  };
-  claimSetupProcess.stdout.on("data", chunk => String(chunk).split(/\r?\n/).filter(Boolean).forEach(handleLine));
-  claimSetupProcess.stderr.on("data", chunk => String(chunk).split(/\r?\n/).filter(Boolean).forEach(handleLine));
-
-  const safetyTimer = setTimeout(() => {
-    if (claimSetupProcess) {
-      log("[playit] Claim setup abandoned after 10 minutes — cleaning up.");
-      try { claimSetupProcess.kill("SIGKILL"); } catch {}
-      claimSetupProcess = null;
-    }
-  }, 10 * 60 * 1000);
-
-  claimSetupProcess.on("close", code => {
-    clearTimeout(safetyTimer);
-    log(`[playit] Claim setup process exited (${code ?? 0})`);
-    claimSetupProcess = null;
-    // Deliberately not inferring success/failure from this exit code — the confirmed
-    // real success signal is the daemon's own "connected" line, already handled above.
-  });
-
-  claimSetupProcess.on("error", err => {
-    clearTimeout(safetyTimer);
-    log(`[playit] Claim setup spawn error: ${err.message}`);
-    claimSetupProcess = null;
-  });
 }
 
 // ─── Paper API ────────────────────────────────────────────────────────────────
@@ -1333,24 +1323,28 @@ async function handleRequest(action, payload = {}) {
       return { ok: true, started: true };
     }
 
-    // BEFORE: called execFileSync(PLAYIT_CLI, ["claim", "exchange", code]) — compiled binary, broken.
-    // AFTER: runs the CONFIRMED real one-time claim command from your own device history
-    //        (`playit setup`, run while playitd is already running). We do NOT have a
-    //        confirmed output format for this command specifically (only playitd's own
-    //        output was verified), so rather than guess a parser, this returns the raw
-    //        real output directly to the UI — the same honest approach as shell.exec.
-    // BEFORE: blocked for up to 20 seconds then SIGKILLed the claim process — this is
-    //         exactly what cut off real, successfully-printed claim URLs before you could
-    //         use them, forcing a new URL on every retry.
-    // AFTER: this is now mostly a manual re-trigger — startClaimSetup() already auto-runs
-    //        the moment the daemon reports unclaimed (see parsePlayitLine). This handler
-    //        just ensures the daemon is running and the claim process is (re)started if not
-    //        already active, then returns immediately. The real URL arrives via the
-    //        tunnel.status broadcast the instant it's printed, not from this response.
-    case "playit.claim": {
-      if (!playitProcess) await startPlayit();
-      await startClaimSetup();
-      return { ok: true, claimUrl: state.tunnel.claimUrl };
+    // BEFORE: called execFileSync(PLAYIT_CLI, ["claim", "exchange", code]) — compiled binary,
+    //         broken. Then replaced with startClaimSetup() running `playit setup` — ALSO
+    //         confirmed broken: the installed playit version (1.0.10) has no `setup`
+    //         subcommand at all ("error: unexpected argument 'setup' found").
+    // AFTER: the CLI no longer generates its own claim link (confirmed: running the bare
+    //        daemon with no secret hangs forever on "Waiting for frontend secret
+    //        provisioning over IPC", no URL ever appears, even after 60+s). The real
+    //        working replacement, confirmed directly from playit.gg's own website
+    //        (account/setup/wizard -> Docker step): a SECRET_KEY is generated server-side
+    //        up front and handed to the daemon directly via its confirmed real --secret
+    //        flag — no claim link involved at all. This handler saves the key the user
+    //        pasted in the app and (re)starts the daemon with it.
+    case "playit.set_secret": {
+      const secret = String(payload.secret || "").trim();
+      if (!secret) throw new Error("No secret key provided");
+      await saveSecret(secret);
+      if (playitProcess) {
+        await stopPlayit();
+        await new Promise(r => setTimeout(r, 800));
+      }
+      await startPlayit();
+      return { ok: true };
     }
 
     // BEFORE: was missing entirely — "Save Addresses" button always threw "Unknown action".
@@ -1385,6 +1379,7 @@ async function handleRequest(action, payload = {}) {
       try { listOutput = execSync("proot-distro list 2>&1", { encoding: "utf8" }); } catch (e) { listOutput = String(e.stdout || ""); }
       const debianInstalled = new RegExp(`\\*\\s*${DEBIAN_DISTRO}\\b`).test(listOutput);
       const running         = !!playitProcess;
+      const hasSecret       = !!(await getSavedSecret());
       let   savedTunnels    = {};
       try { savedTunnels = JSON.parse(await fs.readFile(PLAYIT_TUNNELS_FILE, "utf8")); } catch {}
 
@@ -1405,6 +1400,7 @@ async function handleRequest(action, payload = {}) {
       return {
         binaryExists: debianInstalled,
         hasConfig,
+        hasSecret,
         running,
         tunnelState: state.tunnel.state,
         claimUrl:    state.tunnel.claimUrl,
