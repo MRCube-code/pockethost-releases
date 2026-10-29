@@ -388,6 +388,12 @@ function parsePlayitLine(line) {
   if (/configured agent secret is no longer valid|InvalidAgentKey/i.test(clean)) {
     log("[playit] Saved secret was rejected by playit.gg — clearing it.");
     fs.rm(PLAYIT_SECRET_FILE, { force: true }).catch(() => {});
+    // Also wipe playitd's OWN persisted config (see clearPlayitdConfig() below) — leaving
+    // it behind means the next secret the user pastes gets silently shadowed by this same
+    // dead one, confirmed real on a device: multiple fresh secrets saved through the app
+    // all failed with this exact error, because playit.toml never stopped holding the
+    // very first (now-dead) secret this agent was ever given.
+    clearPlayitdConfig().catch(() => {});
     state.tunnel.state  = "waiting_auth";
     state.tunnel.online = false;
     changed = true;
@@ -434,6 +440,25 @@ function parsePlayitLine(line) {
   if (changed) broadcast("tunnel.status", { tunnel: state.tunnel });
 }
 
+// BEFORE: switching to a new secret (or clearing a dead one) only ever touched our own
+//         secret.key cache. playitd keeps its OWN separate copy of whatever secret it was
+//         last given, persisted inside the Debian container at
+//         /root/.config/playit_gg/playit.toml — confirmed real on a device: after saving a
+//         brand new secret through the app, that file still held the OLD dead secret, and
+//         playitd kept authenticating with THAT instead of the fresh value passed via
+//         --secret on the command line. In other words, --secret only actually matters the
+//         very first time playitd runs with no config file yet; every run after that, a
+//         leftover config silently wins over whatever we pass.
+// AFTER: wipe playitd's own persisted config whenever we're about to hand it a different
+//        secret, so --secret can never be silently shadowed by a stale one again.
+async function clearPlayitdConfig() {
+  try {
+    await runCmd("proot-distro", ["login", DEBIAN_DISTRO, "--", "rm", "-rf", "/root/.config/playit_gg"]);
+  } catch (err) {
+    log(`[playit] Could not clear playitd's internal config (non-fatal): ${err.message}`);
+  }
+}
+
 // Our own small cache of the user-pasted playit.gg secret key — see startPlayit()'s
 // BEFORE/AFTER comment below for why this replaces the old (now-broken) claim-link flow.
 async function getSavedSecret() {
@@ -447,6 +472,10 @@ async function getSavedSecret() {
 
 async function saveSecret(secret) {
   await fs.mkdir(PLAYIT_DIR, { recursive: true });
+  // Clear playitd's stale persisted config first (see clearPlayitdConfig() above) — this
+  // MUST happen before the new secret is used, otherwise the new secret gets silently
+  // ignored in favor of whatever playitd already has saved internally.
+  await clearPlayitdConfig();
   await fs.writeFile(PLAYIT_SECRET_FILE, secret.trim());
 }
 
@@ -1367,6 +1396,24 @@ async function handleRequest(action, payload = {}) {
 
     case "playit.stop": {
       await stopPlayit();
+      return { ok: true };
+    }
+
+    // BEFORE: recovering from a stale/rejected secret required manual Termux commands —
+    //         `rm secret.key`, `rm tunnels.json`, `proot-distro login debian -- rm -rf
+    //         /root/.config/playit_gg` — confirmed painful on a real device while debugging
+    //         the stale-playitd-config bug above (clearPlayitdConfig()).
+    // AFTER: one action the app can trigger from a "Reset Tunnel" button. Reuses the same
+    //        clearPlayitdConfig() fix so a freshly pasted secret can never be shadowed by a
+    //        leftover internal playitd config, and clears our own secret + address cache too.
+    case "playit.reset": {
+      if (playitProcess) await stopPlayit();
+      await clearPlayitdConfig();
+      await fs.rm(PLAYIT_SECRET_FILE, { force: true }).catch(() => {});
+      await fs.rm(PLAYIT_TUNNELS_FILE, { force: true }).catch(() => {});
+      state.tunnel = { online: false, state: "waiting_auth", claimUrl: "", bedrockAddress: "", javaAddress: "", method: "playit" };
+      broadcast("tunnel.status", { tunnel: state.tunnel });
+      log("[playit] Tunnel reset — secret key and saved addresses cleared.");
       return { ok: true };
     }
 
